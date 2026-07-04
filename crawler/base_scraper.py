@@ -111,7 +111,7 @@ Return ONLY valid JSON, no markdown, no explanation."""
 
         gemini_url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+            f"gemini-2.5-flash:generateContent?key={self.gemini_api_key}"
         )
 
         for attempt in range(3):
