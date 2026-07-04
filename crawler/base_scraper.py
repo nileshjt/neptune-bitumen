@@ -196,5 +196,21 @@ Return ONLY valid JSON, no markdown, no explanation."""
                 time.sleep(wait)
         return None
 
+    def upload_to_gcs(self, file_bytes: bytes, filename: str, content_type: str = "application/pdf") -> Optional[str]:
+        """Upload file bytes to GCS public bucket and return public URL."""
+        try:
+            from google.cloud import storage as gcs
+            import os
+            bucket_name = os.environ.get("GCS_BUCKET", "neptune-bitumen-docs")
+            client = gcs.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(filename)
+            blob.upload_from_string(file_bytes, content_type=content_type)
+            blob.make_public()
+            return blob.public_url
+        except Exception as e:
+            logger.error(f"GCS upload failed for {filename}: {e}")
+            return None
+
     def close(self):
         self.client.close()

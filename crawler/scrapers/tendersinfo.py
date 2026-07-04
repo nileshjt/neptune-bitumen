@@ -99,6 +99,12 @@ class TendersInfoScraper(BaseScraper):
                         if country and not any(c in country for c in TARGET_COUNTRIES):
                             continue
 
+                        # Try to download the tender document from detail page
+                        if tid:
+                            doc_url = self._download_tender_doc(page, ctx, tid)
+                            if doc_url:
+                                item["document_urls"] = [doc_url]
+
                         tender = self._to_tender(item)
                         if tender:
                             tenders.append(tender)
@@ -111,6 +117,60 @@ class TendersInfoScraper(BaseScraper):
 
         logger.info(f"TendersInfo: {len(tenders)} target-country bitumen tenders saved")
         return tenders
+
+    def _download_tender_doc(self, page, ctx, tid: str) -> Optional[str]:
+        """Visit detail page, download tender document, upload to GCS, return public URL."""
+        import tempfile, os
+        detail_url = f"{BASE_URL}/Tender/TenderDetail/{tid}"
+        detail_page = ctx.new_page()
+        try:
+            detail_page.goto(detail_url, timeout=30000)
+            detail_page.wait_for_load_state("networkidle", timeout=15000)
+            detail_page.wait_for_timeout(3000)
+
+            # Look for a download link/button
+            # TendersInfo typically has a "Download" button or a PDF link
+            download_el = detail_page.query_selector(
+                "a[href*='download'], a[href*='.pdf'], a[href*='.zip'], "
+                "button:has-text('Download'), a:has-text('Download Document'), "
+                "a:has-text('Download'), a:has-text('Attachment')"
+            )
+
+            if not download_el:
+                logger.info(f"TendersInfo TID {tid}: no download button found")
+                return None
+
+            href = download_el.get_attribute("href") or ""
+
+            if href and (href.endswith(".pdf") or href.endswith(".zip") or "download" in href.lower()):
+                # Direct URL — download using httpx with session cookies
+                if not href.startswith("http"):
+                    href = BASE_URL + href if href.startswith("/") else BASE_URL + "/" + href
+                cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+                resp = self.client.get(href, headers={"Referer": detail_url}, cookies=cookies, timeout=60.0)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    ext = ".pdf" if "pdf" in resp.headers.get("content-type", "") else os.path.splitext(href)[1] or ".pdf"
+                    filename = f"TI-{tid}{ext}"
+                    return self.upload_to_gcs(resp.content, filename, resp.headers.get("content-type", "application/pdf"))
+            else:
+                # Use Playwright download handler
+                with detail_page.expect_download(timeout=30000) as dl_info:
+                    download_el.click()
+                dl = dl_info.value
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(dl.suggested_filename)[1] or ".pdf") as tmp:
+                    dl.save_as(tmp.name)
+                    with open(tmp.name, "rb") as f:
+                        file_bytes = f.read()
+                os.unlink(tmp.name)
+                if len(file_bytes) > 1000:
+                    filename = f"TI-{tid}{os.path.splitext(dl.suggested_filename)[1] or '.pdf'}"
+                    return self.upload_to_gcs(file_bytes, filename)
+
+        except Exception as e:
+            logger.warning(f"TendersInfo doc download failed for TID {tid}: {e}")
+        finally:
+            detail_page.close()
+        return None
 
     def _parse_html(self, html: str) -> list[dict]:
         items = []
@@ -218,7 +278,7 @@ class TendersInfoScraper(BaseScraper):
             "estimated_value_usd": self._parse_value(item.get("worth", "")) or ai_info.get("estimated_value_usd"),
             "currency": "USD",
             "source_url": item.get("url", SEARCH_URL),
-            "document_urls": [],
+            "document_urls": item.get("document_urls", []),
             "raw_text": raw[:2000],
             "status": "active",
         }
