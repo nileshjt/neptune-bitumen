@@ -92,12 +92,39 @@ class GlobalTendersScraper(BaseScraper):
 
                     page.wait_for_timeout(3000)
                     html = page.inner_text("body")
+
+                    # Extract detail URLs and GT IDs from the page links
+                    detail_links = page.query_selector_all("a[href*='/tender-detail/']")
+                    pdf_links = page.query_selector_all("a[href*='/saveAsPDF/']")
+                    detail_urls = [el.get_attribute("href") for el in detail_links if el.get_attribute("href")]
+                    gt_ids = []
+                    for el in pdf_links:
+                        href = el.get_attribute("href") or ""
+                        m = re.search(r"/saveAsPDF/(\d+)", href)
+                        if m:
+                            gt_ids.append(m.group(1))
+
                     items = self._parse_text(html)
                     if not items:
                         logger.info(f"GlobalTenders page {pg}: no items, stopping")
                         break
 
+                    # Pair each item with its detail URL and GT ID
+                    for i, item in enumerate(items):
+                        if i < len(detail_urls):
+                            item["detail_url"] = detail_urls[i]
+                        if i < len(gt_ids):
+                            item["gt_id"] = gt_ids[i]
+
                     for item in items:
+                        # Fetch richer text from detail page
+                        detail_url = item.get("detail_url", "")
+                        if detail_url:
+                            detail_text = self._fetch_detail_text(page, detail_url)
+                            if detail_text:
+                                item["raw"] = detail_text
+                                item["url"] = detail_url
+
                         tender = self._parse_item(item)
                         if tender:
                             tenders.append(tender)
@@ -114,6 +141,21 @@ class GlobalTendersScraper(BaseScraper):
 
         logger.info(f"GlobalTenders: {len(tenders)} bitumen tenders saved")
         return tenders
+
+    def _fetch_detail_text(self, page, detail_url: str) -> str:
+        """Fetch richer tender text from the GlobalTenders detail page."""
+        try:
+            detail_page = page.context.new_page()
+            detail_page.goto(detail_url, timeout=30000)
+            detail_page.wait_for_load_state("networkidle", timeout=15000)
+            detail_page.wait_for_timeout(2000)
+            text = detail_page.inner_text("body")
+            detail_page.close()
+            # Strip boilerplate footer/nav noise — keep first 3000 chars which has the tender content
+            return text[:3000]
+        except Exception as e:
+            logger.warning(f"GlobalTenders detail fetch failed for {detail_url}: {e}")
+            return ""
 
     def _parse_text(self, text: str) -> list[dict]:
         """Parse inner_text of GlobalTenders search results page.
@@ -192,8 +234,10 @@ class GlobalTendersScraper(BaseScraper):
                 except ValueError:
                     continue
 
-        tender_id = f"GT-{hashlib.md5((title + raw[:100]).encode()).hexdigest()[:12]}"
-        ai_info = self.extract_tender_info(title, item.get("url", ""))
+        gt_id = item.get("gt_id", "")
+        tender_id = f"GT-{gt_id}" if gt_id else f"GT-{hashlib.md5((title + raw[:100]).encode()).hexdigest()[:12]}"
+        source_url = item.get("detail_url") or item.get("url", SEARCH_URL)
+        ai_info = self.extract_tender_info(title + " " + raw[:500], source_url)
 
         return {
             "tender_id": tender_id,
@@ -206,8 +250,8 @@ class GlobalTendersScraper(BaseScraper):
             "submission_deadline": deadline or ai_info.get("submission_deadline"),
             "estimated_value_usd": ai_info.get("estimated_value_usd"),
             "currency": "USD",
-            "source_url": item.get("url", SEARCH_URL),
+            "source_url": source_url,
             "document_urls": [],
-            "raw_text": raw[:2000],
+            "raw_text": raw[:3000],
             "status": "active",
         }
